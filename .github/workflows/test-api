@@ -1,33 +1,169 @@
-name: Test Serv00 API
+name: Test ETF Database API
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  test-database-api:
     runs-on: ubuntu-latest
 
     steps:
-
-      - name: Health check
+      - name: Show runner information
         run: |
-          curl \
+          echo "=== GitHub Runner ==="
+          echo "UTC time:"
+          date -u
+
+          echo
+          echo "Runner public IP:"
+          curl --silent https://api.ipify.org
+          echo
+
+      - name: Test API health and database read
+        env:
+          ETF_API_URL: ${{ secrets.ETF_API_URL }}
+        run: |
+          echo "=== Database READ Test ==="
+
+          response=$(curl \
             --fail \
             --show-error \
             --silent \
-            "${{ secrets.ETF_API_URL }}/api/v1/health"
+            --connect-timeout 15 \
+            --max-time 30 \
+            "$ETF_API_URL/api/v1/health")
 
-      - name: Database write test
+          echo "$response"
+
+          echo "$response" | python3 -c '
+          import json
+          import sys
+
+          data = json.load(sys.stdin)
+
+          if data.get("success") is not True:
+              raise SystemExit("Health check returned success != true")
+
+          if data.get("database") != "p11058_etf":
+              raise SystemExit(
+                  f"Unexpected database: {data.get(\"database\")}"
+              )
+
+          tables = data.get("tables", {})
+
+          required = {
+              "etf_master",
+              "etf_share_daily",
+              "import_log",
+          }
+
+          missing = required - set(tables)
+
+          if missing:
+              raise SystemExit(
+                  f"Missing database tables: {sorted(missing)}"
+              )
+
+          print("")
+          print("DATABASE READ TEST: SUCCESS")
+          print(
+              f"etf_master rows: "
+              f"{tables[\"etf_master\"]}"
+          )
+          print(
+              f"etf_share_daily rows: "
+              f"{tables[\"etf_share_daily\"]}"
+          )
+          print(
+              f"import_log rows: "
+              f"{tables[\"import_log\"]}"
+          )
+          '
+
+      - name: Test authenticated database write
+        env:
+          ETF_API_URL: ${{ secrets.ETF_API_URL }}
+          ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
+          GITHUB_RUN_ID_VALUE: ${{ github.run_id }}
         run: |
-          curl \
+          echo "=== Database WRITE Test ==="
+
+          body=$(python3 - <<'PY'
+          import json
+          import os
+
+          print(
+              json.dumps(
+                  {
+                      "source": "github-api-test",
+                      "message": (
+                          "GitHub Actions database write test. "
+                          "Run ID: "
+                          + os.environ["GITHUB_RUN_ID_VALUE"]
+                      ),
+                  }
+              )
+          )
+          PY
+          )
+
+          response=$(curl \
             --fail \
             --show-error \
             --silent \
+            --connect-timeout 15 \
+            --max-time 30 \
             --request POST \
-            --header "Authorization: Bearer ${{ secrets.ETF_API_TOKEN }}" \
-            --header "Content-Type: application/json" \
-            --data '{
-              "source": "github-api-test",
-              "message": "GitHub to Cloudflare to Serv00 to PostgreSQL works"
-            }' \
-            "${{ secrets.ETF_API_URL }}/api/v1/test"
+            --header \
+              "Authorization: Bearer $ETF_API_TOKEN" \
+            --header \
+              "Content-Type: application/json" \
+            --data "$body" \
+            "$ETF_API_URL/api/v1/test")
+
+          echo "$response"
+
+          echo "$response" | python3 -c '
+          import json
+          import sys
+
+          data = json.load(sys.stdin)
+
+          if data.get("success") is not True:
+              raise SystemExit(
+                  "Database write returned success != true"
+              )
+
+          record = data.get("record", {})
+
+          if record.get("source") != "github-api-test":
+              raise SystemExit(
+                  "Unexpected source in returned record"
+              )
+
+          if not record.get("id"):
+              raise SystemExit(
+                  "No database record ID returned"
+              )
+
+          print("")
+          print("DATABASE WRITE TEST: SUCCESS")
+          print(f"Inserted ID: {record[\"id\"]}")
+          '
+
+      - name: Verify database still healthy after write
+        env:
+          ETF_API_URL: ${{ secrets.ETF_API_URL }}
+        run: |
+          echo "=== Final Database Health Check ==="
+
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --connect-timeout 15 \
+            --max-time 30 \
+            "$ETF_API_URL/api/v1/health"
+
+          echo
+          echo "FINAL HEALTH CHECK: SUCCESS"

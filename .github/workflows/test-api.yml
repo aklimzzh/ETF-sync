@@ -1,86 +1,64 @@
-name: Test ETF Database API
-
-on:
-  workflow_dispatch:
-
-jobs:
-  test-database-api:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Show runner information
-        run: |
-          echo "=== GitHub Runner ==="
-          echo "UTC time:"
-          date -u
-
-          echo
-          echo "Runner public IP:"
-          curl --silent https://api.ipify.org
-          echo
-
-      - name: Test API health and database read
-        env:
-          ETF_API_URL: ${{ secrets.ETF_API_URL }}
-        run: |
-          echo "=== Database READ Test ==="
-
-          curl \
-            --fail \
-            --show-error \
-            --silent \
-            --connect-timeout 15 \
-            --max-time 30 \
-            "$ETF_API_URL/api/v1/health" \
-            -o /tmp/health.json
-
-          cat /tmp/health.json
-          echo
-
-          python3 <<'PY'
-          import json
-
-          with open("/tmp/health.json", encoding="utf-8") as f:
-              data = json.load(f)
-
-          assert data.get("success") is True, \
-              "Health check returned success != true"
-
-          assert data.get("database") == "p11058_etf", \
-              f"Unexpected database: {data.get('database')}"
-
-          tables = data.get("tables", {})
-
-          required = {
-              "etf_master",
-              "etf_share_daily",
-              "import_log",
-          }
-
-          missing = required - set(tables)
-
-          assert not missing, \
-              f"Missing database tables: {sorted(missing)}"
-
-          print()
-          print("DATABASE READ TEST: SUCCESS")
-          print(f"Database: {data['database']}")
-          print(f"User: {data['user']}")
-          print(f"etf_master rows: {tables['etf_master']}")
-          print(
-              "etf_share_daily rows:",
-              tables["etf_share_daily"]
-          )
-          print(f"import_log rows: {tables['import_log']}")
-          PY
-
       - name: Test authenticated database write
         env:
           ETF_API_URL: ${{ secrets.ETF_API_URL }}
           ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
           GITHUB_RUN_ID_VALUE: ${{ github.run_id }}
         run: |
-          echo "=== Database WRITE Test ==="
+          python3 <<'PY'
+          import json
+          import os
+
+          body = {
+              "source": "github-api-test",
+              "message": (
+                  "GitHub Actions database write test. "
+                  f"Run ID: {os.environ['GITHUB_RUN_ID_VALUE']}"
+              ),
+          }
+
+          with open(
+              "/tmp/write-request.json",
+              "w",
+              encoding="utf-8",
+          ) as f:
+              json.dump(body, f)
+          PY
+
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --request POST \
+            --header \
+              "Authorization: Bearer $ETF_API_TOKEN" \
+            --header \
+              "Content-Type: application/json" \
+            --data @/tmp/write-request.json \
+            "$ETF_API_URL/api/v1/test" \
+            -o /tmp/write-response.json
+
+          cat /tmp/write-response.json
+          echo
 
           python3 <<'PY'
-         
+          import json
+
+          with open(
+              "/tmp/write-response.json",
+              encoding="utf-8",
+          ) as f:
+              data = json.load(f)
+
+          assert data["success"] is True
+          assert data["committed"] is True
+          assert data["verified"] is True
+
+          record = data["record"]
+
+          assert record["source"] == "github-api-test"
+
+          print("DATABASE WRITE TEST: SUCCESS")
+          print(f"Inserted ID: {record['id']}")
+          print(f"Message: {record['message']}")
+          print(f"Created: {record['created_at']}")
+          PY

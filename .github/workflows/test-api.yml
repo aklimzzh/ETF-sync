@@ -1,14 +1,87 @@
-      - name: Test authenticated database write
+name: Test ETF Database API
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-database-api:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Show runner information
+        run: |
+          echo "=== GitHub Runner ==="
+          date -u
+          echo
+          echo "Runner public IP:"
+          curl --silent https://api.ipify.org
+          echo
+
+      - name: Test database read
         env:
           ETF_API_URL: ${{ secrets.ETF_API_URL }}
-          ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
+        run: |
+          echo "=== Database READ Test ==="
+
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --connect-timeout 15 \
+            --max-time 30 \
+            "$ETF_API_URL/api/v1/health" \
+            --output /tmp/health.json
+
+          cat /tmp/health.json
+          echo
+
+          python3 <<'PY'
+          import json
+
+          with open("/tmp/health.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          if data.get("success") is not True:
+              raise RuntimeError("Health check failed")
+
+          if data.get("database") != "p11058_etf":
+              raise RuntimeError(
+                  f"Unexpected database: {data.get('database')}"
+              )
+
+          tables = data.get("tables", {})
+
+          required_tables = {
+              "etf_master",
+              "etf_share_daily",
+              "import_log",
+          }
+
+          missing = required_tables - set(tables)
+
+          if missing:
+              raise RuntimeError(
+                  f"Missing tables: {sorted(missing)}"
+              )
+
+          print()
+          print("DATABASE READ TEST: SUCCESS")
+          print(f"Database: {data['database']}")
+          print(f"User: {data['user']}")
+          print(f"etf_master: {tables['etf_master']}")
+          print(f"etf_share_daily: {tables['etf_share_daily']}")
+          print(f"import_log: {tables['import_log']}")
+          PY
+
+      - name: Prepare database write test
+        env:
           GITHUB_RUN_ID_VALUE: ${{ github.run_id }}
         run: |
           python3 <<'PY'
           import json
           import os
 
-          body = {
+          payload = {
               "source": "github-api-test",
               "message": (
                   "GitHub Actions database write test. "
@@ -21,25 +94,37 @@
               "w",
               encoding="utf-8",
           ) as f:
-              json.dump(body, f)
+              json.dump(payload, f)
+
+          print("Test request created.")
           PY
+
+      - name: Test database write
+        env:
+          ETF_API_URL: ${{ secrets.ETF_API_URL }}
+          ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
+        run: |
+          echo "=== Database WRITE Test ==="
 
           curl \
             --fail \
             --show-error \
             --silent \
+            --connect-timeout 15 \
+            --max-time 30 \
             --request POST \
-            --header \
-              "Authorization: Bearer $ETF_API_TOKEN" \
-            --header \
-              "Content-Type: application/json" \
+            --header "Authorization: Bearer $ETF_API_TOKEN" \
+            --header "Content-Type: application/json" \
             --data @/tmp/write-request.json \
             "$ETF_API_URL/api/v1/test" \
-            -o /tmp/write-response.json
+            --output /tmp/write-response.json
 
+          echo "API response:"
           cat /tmp/write-response.json
           echo
 
+      - name: Validate database write
+        run: |
           python3 <<'PY'
           import json
 
@@ -49,16 +134,54 @@
           ) as f:
               data = json.load(f)
 
-          assert data["success"] is True
-          assert data["committed"] is True
-          assert data["verified"] is True
+          if data.get("success") is not True:
+              raise RuntimeError(
+                  "API returned success != true"
+              )
 
-          record = data["record"]
+          if data.get("committed") is not True:
+              raise RuntimeError(
+                  "Database transaction was not committed"
+              )
 
-          assert record["source"] == "github-api-test"
+          if data.get("verified") is not True:
+              raise RuntimeError(
+                  "Inserted record was not verified"
+              )
 
+          record = data.get("record")
+
+          if not record:
+              raise RuntimeError(
+                  "No record returned"
+              )
+
+          if record.get("source") != "github-api-test":
+              raise RuntimeError(
+                  f"Unexpected source: {record.get('source')}"
+              )
+
+          print()
           print("DATABASE WRITE TEST: SUCCESS")
           print(f"Inserted ID: {record['id']}")
+          print(f"Source: {record['source']}")
           print(f"Message: {record['message']}")
-          print(f"Created: {record['created_at']}")
+          print(f"Created at: {record['created_at']}")
           PY
+
+      - name: Final database health check
+        env:
+          ETF_API_URL: ${{ secrets.ETF_API_URL }}
+        run: |
+          echo "=== Final Database Health Check ==="
+
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --connect-timeout 15 \
+            --max-time 30 \
+            "$ETF_API_URL/api/v1/health"
+
+          echo
+          echo "FINAL HEALTH CHECK: SUCCESS"

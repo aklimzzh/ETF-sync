@@ -1,0 +1,33 @@
+name: Test Serv00 API
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Health check
+        run: |
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            "${{ secrets.ETF_API_URL }}/api/v1/health"
+
+      - name: Database write test
+        run: |
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --request POST \
+            --header "Authorization: Bearer ${{ secrets.ETF_API_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data '{
+              "source": "github-api-test",
+              "message": "GitHub to Cloudflare to Serv00 to PostgreSQL works"
+            }' \
+            "${{ secrets.ETF_API_URL }}/api/v1/test"

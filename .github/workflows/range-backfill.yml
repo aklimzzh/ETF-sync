@@ -4,39 +4,48 @@ on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: "Start date (YYYY-MM-DD)"
+        description: Start date (YYYY-MM-DD)
         required: true
         type: string
       end_date:
-        description: "End date (YYYY-MM-DD)"
+        description: End date (YYYY-MM-DD)
         required: true
         type: string
+      exchange:
+        description: Exchange to backfill
+        required: true
+        default: ALL
+        type: choice
+        options:
+          - ALL
+          - SSE
+          - SZSE
       force:
-        description: "Re-fetch dates even if they were imported before"
-        required: false
-        default: false
+        description: Re-fetch and UPSERT existing dates
+        required: true
+        default: true
         type: boolean
       no_upload:
-        description: "Archive only; do not upload to Serv00"
-        required: false
+        description: Archive only; do not upload to PostgreSQL
+        required: true
         default: false
         type: boolean
       min_delay_seconds:
-        description: "Minimum delay between trading days"
-        required: false
-        default: "15"
+        description: Minimum delay between trading days
+        required: true
+        default: "20"
         type: string
       max_delay_seconds:
-        description: "Maximum delay between trading days"
-        required: false
-        default: "30"
+        description: Maximum delay between trading days
+        required: true
+        default: "40"
         type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: range-etf-backfill
+  group: etf-data-writer
   cancel-in-progress: false
 
 jobs:
@@ -44,12 +53,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
-    env:
-      ETF_API_URL: ${{ secrets.ETF_API_URL }}
-      ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -58,7 +63,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Install dependencies
         run: |
@@ -69,184 +73,100 @@ jobs:
         env:
           START_DATE: ${{ inputs.start_date }}
           END_DATE: ${{ inputs.end_date }}
-          MIN_DELAY: ${{ inputs.min_delay_seconds }}
-          MAX_DELAY: ${{ inputs.max_delay_seconds }}
         run: |
           python <<'PY'
-          import json
           import os
           from datetime import date
-
           import akshare as ak
-          import pandas as pd
 
           start = date.fromisoformat(os.environ["START_DATE"])
           end = date.fromisoformat(os.environ["END_DATE"])
-
           if end < start:
-              raise SystemExit("end_date must be on or after start_date")
-
-          span = (end - start).days
-          if span > 90:
-              raise SystemExit(
-                  f"Date range is {span} days. Maximum allowed range is 90 days."
-              )
-
-          min_delay = int(os.environ["MIN_DELAY"])
-          max_delay = int(os.environ["MAX_DELAY"])
-
-          if min_delay < 0 or max_delay < min_delay or max_delay > 300:
-              raise SystemExit("Invalid delay range")
+              raise SystemExit("end_date must not be earlier than start_date")
+          if (end - start).days > 90:
+              raise SystemExit("Range is limited to 90 calendar days")
 
           calendar = ak.tool_trade_date_hist_sina()
-
-          if "trade_date" not in calendar.columns:
-              raise SystemExit("AKShare calendar has no trade_date column")
-
-          trading_days = sorted(
-              d
-              for d in pd.to_datetime(
-                  calendar["trade_date"],
-                  errors="raise",
-              ).dt.date.tolist()
+          days = sorted(
+              d.isoformat()
+              for d in calendar["trade_date"].tolist()
               if start <= d <= end
           )
-
-          if not trading_days:
-              raise SystemExit("No trading days found in requested range")
-
-          payload = [d.isoformat() for d in trading_days]
-
-          with open("/tmp/trading-days.json", "w", encoding="utf-8") as f:
-              json.dump(payload, f)
-
-          print("=" * 64)
-          print("ETF RANGE BACKFILL")
-          print("=" * 64)
-          print(f"Requested range : {start} -> {end}")
-          print(f"Calendar days   : {span + 1}")
-          print(f"Trading days    : {len(payload)}")
-          print(f"Delay           : {min_delay}-{max_delay} seconds")
-          print()
-          print("Trading-day list:")
-          for index, day in enumerate(payload, start=1):
-              print(f"  {index:>3}. {day}")
+          if not days:
+              raise SystemExit("No trading days found in the requested range")
+          with open("/tmp/trading-days.txt", "w", encoding="utf-8") as handle:
+              handle.write("\n".join(days) + "\n")
+          print(f"Trading days: {len(days)}")
+          print("\n".join(days))
           PY
 
       - name: Run range backfill
         env:
-          FORCE_REFETCH: ${{ inputs.force }}
+          ETF_API_URL: ${{ secrets.ETF_API_URL }}
+          ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
+          EXCHANGE: ${{ inputs.exchange }}
           NO_UPLOAD: ${{ inputs.no_upload }}
           MIN_DELAY: ${{ inputs.min_delay_seconds }}
           MAX_DELAY: ${{ inputs.max_delay_seconds }}
         run: |
           python <<'PY'
-          import json
           import os
           import random
           import subprocess
           import sys
           import time
 
-          with open("/tmp/trading-days.json", encoding="utf-8") as f:
-              days = json.load(f)
-
-          force = os.environ["FORCE_REFETCH"].lower() == "true"
+          days = [line.strip() for line in open("/tmp/trading-days.txt", encoding="utf-8") if line.strip()]
+          exchange = os.environ["EXCHANGE"]
           no_upload = os.environ["NO_UPLOAD"].lower() == "true"
           min_delay = int(os.environ["MIN_DELAY"])
           max_delay = int(os.environ["MAX_DELAY"])
+          if min_delay < 0 or max_delay < min_delay or max_delay > 300:
+              raise SystemExit("Invalid delay range")
 
-          results = []
+          successes = []
+          failures = []
 
-          for index, day in enumerate(days, start=1):
-              print()
-              print("=" * 64)
-              print(f"[{index}/{len(days)}] {day}")
-              print("=" * 64)
-              sys.stdout.flush()
+          for index, trade_date in enumerate(days, start=1):
+              print("=" * 64, flush=True)
+              print(f"[{index}/{len(days)}] {trade_date} | exchange={exchange}", flush=True)
+              print("=" * 64, flush=True)
 
               command = [
-                  sys.executable,
-                  "-m",
-                  "src.main",
-                  "--date",
-                  day,
+                  sys.executable, "-m", "src.main",
+                  "--date", trade_date,
+                  "--exchange", exchange,
+                  "--force",
               ]
-
-              # Range mode already uses a verified AKShare-generated trading-day
-              # list. --force tells main.py not to run its own calendar gate.
-              command.append("--force")
-
               if no_upload:
                   command.append("--no-upload")
 
-              # Retry an individual day. This is intentionally sequential and
-              # conservative because SSE/SZSE may temporarily reset/forbid
-              # datacenter requests during repeated historical downloads.
-              backoffs = [15, 30, 60]
-              final_code = None
-
-              for attempt in range(1, 5):
-                  print(f"Attempt {attempt}/4: {' '.join(command)}")
-                  sys.stdout.flush()
-
-                  run = subprocess.run(command, check=False)
-                  final_code = run.returncode
-
-                  if final_code == 0:
-                      break
-
-                  if attempt < 4:
-                      wait = backoffs[attempt - 1]
-                      print(
-                          f"{day}: attempt failed with exit code "
-                          f"{final_code}; retrying in {wait}s"
-                      )
-                      sys.stdout.flush()
-                      time.sleep(wait)
-
-              state = "SUCCESS" if final_code == 0 else "FAILED"
-              results.append(
-                  {
-                      "trade_date": day,
-                      "status": state,
-                      "exit_code": final_code,
-                  }
-              )
-
-              print(f"{day}: {state}")
+              # Market modules own their retry policy. Do not rerun a successful
+              # market merely because the other market failed.
+              result = subprocess.run(command, check=False)
+              if result.returncode == 0:
+                  successes.append(trade_date)
+                  print(f"{trade_date}: SUCCESS", flush=True)
+              else:
+                  failures.append((trade_date, result.returncode))
+                  print(f"{trade_date}: FAILED (exit {result.returncode})", flush=True)
 
               if index < len(days):
                   delay = random.randint(min_delay, max_delay)
-                  print(f"Sleeping {delay}s before next trading day...")
-                  sys.stdout.flush()
+                  print(f"Sleeping {delay}s before next trading day...", flush=True)
                   time.sleep(delay)
 
-          with open("/tmp/range-results.json", "w", encoding="utf-8") as f:
-              json.dump(results, f, indent=2)
-
-          success = [x for x in results if x["status"] == "SUCCESS"]
-          failed = [x for x in results if x["status"] == "FAILED"]
-
-          print()
           print("=" * 64)
           print("RANGE BACKFILL SUMMARY")
           print("=" * 64)
-          print(f"Trading days : {len(results)}")
-          print(f"Success      : {len(success)}")
-          print(f"Failed       : {len(failed)}")
-
-          if failed:
-              print()
+          print(f"Exchange     : {exchange}")
+          print(f"Trading days : {len(days)}")
+          print(f"Success      : {len(successes)}")
+          print(f"Failed       : {len(failures)}")
+          if failures:
               print("Failed dates:")
-              for item in failed:
-                  print(
-                      f"  {item['trade_date']} "
-                      f"(exit code {item['exit_code']})"
-                  )
-
-              # Let all dates finish first, then fail the job so the workflow
-              # cannot appear green when historical coverage is incomplete.
+              for day, code in failures:
+                  print(f"  {day} (exit code {code})")
               raise SystemExit(1)
           PY
 
@@ -255,30 +175,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          echo "=== Git status before commit ==="
-          git status --short
-
           git add data/
-
           if git diff --cached --quiet; then
-            echo "No new or changed data files."
-          else
-            git commit \
-              -m "data: range ETF backfill ${{ inputs.start_date }} to ${{ inputs.end_date }} [skip ci]"
+            echo "No data changes to commit."
+            exit 0
           fi
-
-          echo "=== Git status after commit ==="
-          git status --short
-
-          # Preserve any remaining untracked/unstaged runtime changes
-
-      - name: Upload range result log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: range-backfill-${{ inputs.start_date }}-to-${{ inputs.end_date }}
-          path: |
-            /tmp/trading-days.json
-            /tmp/range-results.json
-          retention-days: 14
+          git commit -m "data: ${{ inputs.exchange }} range backfill ${{ inputs.start_date }} to ${{ inputs.end_date }} [skip ci]"
+          git stash push --include-untracked --message "range-backfill-runtime" || true
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

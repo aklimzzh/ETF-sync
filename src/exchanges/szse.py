@@ -14,7 +14,7 @@ import pandas as pd
 
 SZSE_URL = "https://www.szse.cn/api/report/ShowReport"
 SZSE_REFERER = "https://www.szse.cn/market/fund/volume/etf/index.html"
-SZSE_SHARE_UNIT_DIVISOR = Decimal("10000")
+SZSE_SHARE_UNIT_DIVISOR = Decimal("10000")  # XLSX: shares; DB: 10,000 shares
 
 
 def download_szse(target_date: date, timeout: tuple[int, int] = (15, 60)) -> bytes:
@@ -127,10 +127,7 @@ def normalize_szse(content: bytes) -> list[dict[str, str | None]]:
         code_digits = re.sub(r"\.0$", "", code)
         try:
             trade_date = pd.to_datetime(raw_date, errors="raise").date().isoformat()
-            total_share = (
-                Decimal(raw_share)
-                / SZSE_SHARE_UNIT_DIVISOR
-            )
+            total_share = Decimal(raw_share) / SZSE_SHARE_UNIT_DIVISOR
         except (ValueError, TypeError, InvalidOperation) as exc:
             raise ValueError(f"Invalid SZSE row: {row.to_dict()}") from exc
         normalized.append(

@@ -256,18 +256,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          echo "=== Git status before commit ==="
+          git status --short
+
           git add data/
 
           if git diff --cached --quiet; then
             echo "No new or changed data files."
           else
-            git commit -m "data: range ETF backfill ${{ inputs.start_date }} to ${{ inputs.end_date }} [skip ci]"
-
-            # A daily job or another manual run may have pushed while this
-            # long-running range job was executing. Rebase before pushing.
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            git commit \
+              -m "data: range ETF backfill ${{ inputs.start_date }} to ${{ inputs.end_date }} [skip ci]"
           fi
+
+          echo "=== Git status after commit ==="
+          git status --short
+
+          # Preserve any remaining untracked/unstaged runtime changes
 
       - name: Upload range result log
         if: always()

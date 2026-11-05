@@ -42,7 +42,9 @@ jobs:
               data = json.load(f)
 
           if data.get("success") is not True:
-              raise RuntimeError("Health check failed")
+              raise RuntimeError(
+                  "Health check returned success != true"
+              )
 
           if data.get("database") != "p11058_etf":
               raise RuntimeError(
@@ -64,15 +66,32 @@ jobs:
                   f"Missing tables: {sorted(missing)}"
               )
 
+          if not data.get("latest_trade_date"):
+              raise RuntimeError(
+                  "latest_trade_date is missing"
+              )
+
           print()
           print("DATABASE READ TEST: SUCCESS")
           print(f"Database: {data['database']}")
-          print(f"User: {data['user']}")
-          print(f"etf_master: {tables['etf_master']}")
-          print(f"etf_share_daily: {tables['etf_share_daily']}")
-          print(f"import_log: {tables['import_log']}")
+          print(
+              f"Latest trade date: "
+              f"{data['latest_trade_date']}"
+          )
+          print(
+              f"etf_master rows: "
+              f"{tables['etf_master']}"
+          )
+          print(
+              f"etf_share_daily rows: "
+              f"{tables['etf_share_daily']}"
+          )
+          print(
+              f"import_log rows: "
+              f"{tables['import_log']}"
+          )
           PY
-
+          
       - name: Prepare database write test
         env:
           GITHUB_RUN_ID_VALUE: ${{ github.run_id }}

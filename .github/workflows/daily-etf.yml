@@ -7,9 +7,6 @@ on:
     - cron: "16 21 * * 0-4"
     - cron: "46 22 * * 0-4"
 
-    # Temporary schedule test
-    - cron: "15 3 * * *"
-
 permissions:
   contents: write
 

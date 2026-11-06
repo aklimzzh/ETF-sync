@@ -3,7 +3,7 @@ name: Daily ETF Import
 on:
   schedule:
     - cron: "36 21 * * 0-4" # Shanghai 05:36 Mon-Fri
-    - cron: "36 23 * * 0-4" # Shanghai 07:36 Mon-Fri, compensation
+    - cron: "36 22 * * 0-4" # Shanghai 06:36 Mon-Fri, compensation
   workflow_dispatch:
 
 permissions:

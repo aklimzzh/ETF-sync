@@ -275,6 +275,15 @@ def main() -> int:
         action="store_true",
     )
 
+    parser.add_argument(
+        "--allow-not-ready",
+        action="store_true",
+        help=(
+            "Allow scheduled daily runs to exit cleanly "
+            "when exchange data is not ready."
+        ),
+    )
+    
     args = parser.parse_args()
     target = args.date or _target_yesterday()
     date.fromisoformat(target)

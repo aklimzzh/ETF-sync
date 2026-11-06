@@ -2,17 +2,13 @@ name: Daily ETF Import
 
 on:
   workflow_dispatch:
-  schedule:
-    # Shanghai Mon-Fri 05:16
-    # UTC Sun-Thu 21:16
-    - cron: "16 21 * * 0-4"
 
-    # Shanghai Mon-Fri 06:46
-    # UTC Sun-Thu 22:46
+  schedule:
+    - cron: "16 21 * * 0-4"
     - cron: "46 22 * * 0-4"
-    
-    # TEMP schedule test
-    - cron: "50 1 * * *"
+
+    # Temporary schedule test
+    - cron: "15 3 * * *"
 
 permissions:
   contents: write

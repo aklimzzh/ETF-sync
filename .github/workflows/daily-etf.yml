@@ -10,14 +10,14 @@ permissions:
   contents: write
 
 concurrency:
-  group: daily-etf-import
+  group: etf-data-writer
   cancel-in-progress: false
 
 jobs:
   import-etf:
+    name: Import ETF Data
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     env:
       ETF_API_URL: ${{ secrets.ETF_API_URL }}
       ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
@@ -25,18 +25,12 @@ jobs:
     steps:
       - name: Show trigger information
         run: |
-          echo "========================================"
-          echo "Daily ETF Import"
-          echo "========================================"
           echo "Event: ${{ github.event_name }}"
           echo "Schedule: ${{ github.event.schedule }}"
-          echo
           echo "UTC time:"
           date -u
-          echo
           echo "Shanghai time:"
           TZ=Asia/Shanghai date
-          echo "========================================"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -55,77 +49,57 @@ jobs:
           pip install -r requirements.txt
 
       - name: Show ETF importer options
-        run: |
-          python -m src.main --help
+        run: python -m src.main --help
 
       - name: Fetch, validate, archive and import
-        run: |
-          python -m src.main --allow-not-ready
+        run: python -m src.main --allow-not-ready
 
       - name: Commit new data files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add data/
 
           if git diff --cached --quiet; then
             echo "No new data files."
           else
-            git commit \
-              -m "data: update ETF shares [skip ci]"
-
-            # Protect against another data workflow having pushed
-            # while this run was executing.
-            git stash push \
-              --include-untracked \
-              --message "daily-etf-runtime" || true
-
-            git pull \
-              --rebase \
-              origin \
-              "${GITHUB_REF_NAME}"
-
-            git push \
-              origin \
-              "HEAD:${GITHUB_REF_NAME}"
+            git commit -m "data: update ETF shares [skip ci]"
+            git stash push --include-untracked --message "daily-etf-runtime" || true
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
 
-      - name: Purge Cloudflare ETF API cache
+      - name: Purge Cloudflare ETF read API cache
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
         run: |
-          echo "=== Purge Cloudflare ETF API Cache ==="
+          python3 <<'PY'
+          import json, os, urllib.request
 
-          response=$(curl \
-            --fail \
-            --show-error \
-            --silent \
-            --request POST \
-            "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache" \
-            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            --header "Content-Type: application/json" \
-            --data '{
+          zone_id = os.environ["CLOUDFLARE_ZONE_ID"]
+          token = os.environ["CLOUDFLARE_API_TOKEN"]
+          endpoint = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/purge_cache"
+          payload = {
               "prefixes": [
-                "etf-api.mydomain.xyz/api/v1/dashboard/",
-                "etf-api.mydomain.xyz/api/v1/rankings",
-                "etf-api.mydomain.xyz/api/v1/etf/"
+                  "etf-api.mydomain.xyz/api/v1/dashboard/",
+                  "etf-api.mydomain.xyz/api/v1/rankings",
+                  "etf-api.mydomain.xyz/api/v1/etf/",
               ]
-            }')
-
-          echo "$response"
-
-          echo "$response" | python3 -c '
-          import json
-          import sys
-
-          data = json.load(sys.stdin)
-
-          if data.get("success") is not True:
-              raise SystemExit(
-                  "Cloudflare cache purge failed"
-              )
-
-          print("CLOUDFLARE CACHE PURGE: SUCCESS")
-          '
+          }
+          req = urllib.request.Request(
+              endpoint,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=30) as response:
+              result = json.load(response)
+          print(json.dumps(result, ensure_ascii=False))
+          if result.get("success") is not True:
+              raise SystemExit("Cloudflare prefix purge failed")
+          print("CLOUDFLARE PREFIX PURGE: SUCCESS")
+          PY

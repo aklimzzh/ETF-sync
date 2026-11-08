@@ -50,10 +50,25 @@ concurrency:
 
 jobs:
   range-backfill:
+    name: Backfill ETF range
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
+    env:
+      ETF_API_URL: ${{ secrets.ETF_API_URL }}
+      ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
+
     steps:
+      - name: Show run configuration
+        run: |
+          echo "Start date : ${{ inputs.start_date }}"
+          echo "End date   : ${{ inputs.end_date }}"
+          echo "Exchange   : ${{ inputs.exchange }}"
+          echo "Force      : ${{ inputs.force }}"
+          echo "No upload  : ${{ inputs.no_upload }}"
+          echo "UTC time   : $(date -u)"
+          echo "Shanghai   : $(TZ=Asia/Shanghai date)"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -70,6 +85,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Validate importer options
+        run: python -m src.main --help
+
       - name: Validate inputs and build trading-day list
         env:
           START_DATE: ${{ inputs.start_date }}
@@ -82,6 +100,7 @@ jobs:
 
           start = date.fromisoformat(os.environ["START_DATE"])
           end = date.fromisoformat(os.environ["END_DATE"])
+
           if end < start:
               raise SystemExit("end_date must not be earlier than start_date")
           if (end - start).days > 90:
@@ -93,6 +112,7 @@ jobs:
               for d in calendar["trade_date"].tolist()
               if start <= d <= end
           )
+
           if not days:
               raise SystemExit("No trading days found in the requested range")
 
@@ -104,9 +124,8 @@ jobs:
           PY
 
       - name: Run range backfill
+        id: backfill
         env:
-          ETF_API_URL: ${{ secrets.ETF_API_URL }}
-          ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
           EXCHANGE: ${{ inputs.exchange }}
           FORCE: ${{ inputs.force }}
           NO_UPLOAD: ${{ inputs.no_upload }}
@@ -114,103 +133,255 @@ jobs:
           MAX_DELAY: ${{ inputs.max_delay_seconds }}
         run: |
           python <<'PY'
+          import csv
           import os
           import random
+          import shutil
           import subprocess
           import sys
           import time
+          from collections import defaultdict
+          from pathlib import Path
 
-          days = [line.strip() for line in open("/tmp/trading-days.txt", encoding="utf-8") if line.strip()]
-          exchange = os.environ["EXCHANGE"]
+          days = [
+              line.strip()
+              for line in open("/tmp/trading-days.txt", encoding="utf-8")
+              if line.strip()
+          ]
+          requested = os.environ["EXCHANGE"].upper()
           force = os.environ["FORCE"].lower() == "true"
           no_upload = os.environ["NO_UPLOAD"].lower() == "true"
           min_delay = int(os.environ["MIN_DELAY"])
           max_delay = int(os.environ["MAX_DELAY"])
 
+          if requested not in {"ALL", "SSE", "SZSE"}:
+              raise SystemExit(f"Invalid exchange: {requested}")
           if min_delay < 0 or max_delay < min_delay or max_delay > 300:
               raise SystemExit("Invalid delay range")
 
-          successes = []
-          failures = []
+          markets = ["SSE", "SZSE"] if requested == "ALL" else [requested]
+          success = defaultdict(list)
+          failures = defaultdict(list)
+          skipped = defaultdict(list)
+
+          # Stop asking SSE after two consecutive dates return HTTP 403.
+          sse_403_streak = 0
+          sse_circuit_open = False
+
+          def normalized_path(trade_date: str) -> Path:
+              year = trade_date[:4]
+              return Path("data") / "normalized" / year / f"{trade_date}.csv"
+
+          def preserve_market_csv(trade_date: str, market: str) -> None:
+              source = normalized_path(trade_date)
+              if not source.exists():
+                  return
+              destination = (
+                  Path("data") / "normalized" / market / trade_date[:4]
+                  / f"{trade_date}.csv"
+              )
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source, destination)
+
+          def build_combined_csv(trade_date: str) -> None:
+              parts = []
+              for market in ("SSE", "SZSE"):
+                  path = (
+                      Path("data") / "normalized" / market / trade_date[:4]
+                      / f"{trade_date}.csv"
+                  )
+                  if path.exists():
+                      parts.append(path)
+              if not parts:
+                  return
+
+              destination = normalized_path(trade_date)
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              fieldnames = None
+              rows = []
+              for path in parts:
+                  with path.open(newline="", encoding="utf-8-sig") as handle:
+                      reader = csv.DictReader(handle)
+                      if fieldnames is None:
+                          fieldnames = reader.fieldnames
+                      rows.extend(reader)
+              if not fieldnames:
+                  return
+              rows.sort(key=lambda row: (row.get("exchange", ""), row.get("fund_code", "")))
+              with destination.open("w", newline="", encoding="utf-8-sig") as handle:
+                  writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                  writer.writeheader()
+                  writer.writerows(rows)
 
           for index, trade_date in enumerate(days, start=1):
-              print("=" * 64, flush=True)
-              print(f"[{index}/{len(days)}] {trade_date} | exchange={exchange}", flush=True)
-              print("=" * 64, flush=True)
+              print("=" * 72, flush=True)
+              print(f"[{index}/{len(days)}] {trade_date} | requested={requested}", flush=True)
+              print("=" * 72, flush=True)
 
-              command = [
-                  sys.executable, "-m", "src.main",
-                  "--date", trade_date,
-                  "--exchange", exchange,
-              ]
-              if force:
-                  command.append("--force")
-              if no_upload:
-                  command.append("--no-upload")
+              for market in markets:
+                  if market == "SSE" and sse_circuit_open:
+                      skipped[market].append((trade_date, "SSE HTTP 403 circuit open"))
+                      print(
+                          f"{trade_date} {market}: SKIPPED - circuit open after "
+                          "two consecutive 403 dates",
+                          flush=True,
+                      )
+                      continue
 
-              result = subprocess.run(command, check=False)
-              if result.returncode == 0:
-                  successes.append(trade_date)
-                  print(f"{trade_date}: SUCCESS", flush=True)
-              else:
-                  failures.append((trade_date, result.returncode))
-                  print(f"{trade_date}: FAILED (exit {result.returncode})", flush=True)
+                  command = [
+                      sys.executable,
+                      "-m",
+                      "src.main",
+                      "--date",
+                      trade_date,
+                      "--exchange",
+                      market,
+                  ]
+                  if force:
+                      command.append("--force")
+                  if no_upload:
+                      command.append("--no-upload")
+
+                  print(f"Running {market}: {' '.join(command)}", flush=True)
+                  result = subprocess.run(
+                      command,
+                      check=False,
+                      text=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                  )
+                  output = result.stdout or ""
+                  print(output, end="" if output.endswith("\n") else "\n", flush=True)
+
+                  if result.returncode == 0:
+                      success[market].append(trade_date)
+                      preserve_market_csv(trade_date, market)
+                      print(f"{trade_date} {market}: SUCCESS", flush=True)
+                      if market == "SSE":
+                          sse_403_streak = 0
+                  else:
+                      is_sse_403 = market == "SSE" and "HTTP 403" in output
+                      reason = "HTTP 403" if is_sse_403 else f"exit code {result.returncode}"
+                      failures[market].append((trade_date, reason))
+                      print(f"{trade_date} {market}: FAILED ({reason})", flush=True)
+
+                      if is_sse_403:
+                          sse_403_streak += 1
+                          print(
+                              f"SSE consecutive 403 dates: {sse_403_streak}/2",
+                              flush=True,
+                          )
+                          if sse_403_streak >= 2:
+                              sse_circuit_open = True
+                              print(
+                                  "SSE CIRCUIT OPEN: subsequent SSE dates will be "
+                                  "skipped in this workflow run. Start a new run later "
+                                  "to obtain a new GitHub runner/IP.",
+                                  flush=True,
+                              )
+                      elif market == "SSE":
+                          sse_403_streak = 0
+
+              # Rebuild the legacy combined normalized CSV from whichever market
+              # files are available, so SSE-only/SZSE-only runs do not silently
+              # overwrite the other market's archived normalized data.
+              build_combined_csv(trade_date)
 
               if index < len(days):
                   delay = random.randint(min_delay, max_delay)
                   print(f"Sleeping {delay}s before next trading day...", flush=True)
                   time.sleep(delay)
 
-          print("=" * 64)
+          print("=" * 72)
           print("RANGE BACKFILL SUMMARY")
-          print("=" * 64)
-          print(f"Exchange     : {exchange}")
-          print(f"Trading days : {len(days)}")
-          print(f"Success      : {len(successes)}")
-          print(f"Failed       : {len(failures)}")
+          print("=" * 72)
+          print(f"Requested exchange : {requested}")
+          print(f"Trading days       : {len(days)}")
+          for market in markets:
+              print(f"\n{market}")
+              print(f"  Success          : {len(success[market])}")
+              print(f"  Failed           : {len(failures[market])}")
+              print(f"  Skipped          : {len(skipped[market])}")
+              if failures[market]:
+                  print("  Failed dates:")
+                  for day, reason in failures[market]:
+                      print(f"    {day}: {reason}")
+              if skipped[market]:
+                  print("  Skipped dates:")
+                  for day, reason in skipped[market]:
+                      print(f"    {day}: {reason}")
 
-          if failures:
-              print("Failed dates:")
-              for day, code in failures:
-                  print(f"  {day} (exit code {code})")
-              raise SystemExit(1)
+          any_success = any(success[market] for market in markets)
+          any_failure = any(failures[market] or skipped[market] for market in markets)
+
+          output_file = os.environ.get("GITHUB_OUTPUT")
+          if output_file:
+              with open(output_file, "a", encoding="utf-8") as handle:
+                  handle.write(f"any_success={'true' if any_success else 'false'}\n")
+                  handle.write(f"has_failures={'true' if any_failure else 'false'}\n")
+
+          # Do not fail here. Commit successful market files and purge cached API
+          # data first; the final step will mark the workflow failed if needed.
+          with open("/tmp/range-has-failures.txt", "w", encoding="utf-8") as handle:
+              handle.write("true\n" if any_failure else "false\n")
           PY
 
-      - name: Commit backfilled data
+      - name: Commit successful backfilled data
+        if: ${{ steps.backfill.outputs.any_success == 'true' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add data/
 
           if git diff --cached --quiet; then
             echo "No data changes to commit."
           else
-            git commit -m "data: ${{ inputs.exchange }} range backfill ${{ inputs.start_date }} to ${{ inputs.end_date }} [skip ci]"
-            git stash push --include-untracked --message "range-backfill-runtime" || true
+            git commit \
+              -m "data: ${{ inputs.exchange }} range backfill ${{ inputs.start_date }} to ${{ inputs.end_date }} [skip ci]"
+
+            git stash push \
+              --include-untracked \
+              --message "range-backfill-runtime" || true
+
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
 
       - name: Purge Cloudflare ETF read API cache
-        if: ${{ !inputs.no_upload }}
+        if: ${{ !inputs.no_upload && steps.backfill.outputs.any_success == 'true' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
         run: |
           python3 <<'PY'
-          import json, os, urllib.request
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
 
           zone_id = os.environ["CLOUDFLARE_ZONE_ID"]
           token = os.environ["CLOUDFLARE_API_TOKEN"]
-          endpoint = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/purge_cache"
+          api_url = os.environ["ETF_API_URL"].rstrip("/")
+          parsed = urllib.parse.urlparse(api_url)
+          host = parsed.netloc
+
+          if not host:
+              raise SystemExit(f"Invalid ETF_API_URL: {api_url}")
+
+          endpoint = (
+              "https://api.cloudflare.com/client/v4/zones/"
+              f"{zone_id}/purge_cache"
+          )
           payload = {
               "prefixes": [
-                  "etf-api.mydomain.xyz/api/v1/dashboard/",
-                  "etf-api.mydomain.xyz/api/v1/rankings",
-                  "etf-api.mydomain.xyz/api/v1/etf/",
+                  f"{host}/api/v1/dashboard/",
+                  f"{host}/api/v1/rankings",
+                  f"{host}/api/v1/etf/",
               ]
           }
-          req = urllib.request.Request(
+
+          request = urllib.request.Request(
               endpoint,
               data=json.dumps(payload).encode("utf-8"),
               headers={
@@ -219,10 +390,24 @@ jobs:
               },
               method="POST",
           )
-          with urllib.request.urlopen(req, timeout=30) as response:
+
+          with urllib.request.urlopen(request, timeout=30) as response:
               result = json.load(response)
+
           print(json.dumps(result, ensure_ascii=False))
           if result.get("success") is not True:
               raise SystemExit("Cloudflare prefix purge failed")
+
           print("CLOUDFLARE PREFIX PURGE: SUCCESS")
           PY
+
+      - name: Fail workflow when requested data is incomplete
+        if: ${{ always() && steps.backfill.outcome == 'success' }}
+        run: |
+          if [ -f /tmp/range-has-failures.txt ] && \
+             [ "$(cat /tmp/range-has-failures.txt)" = "true" ]; then
+            echo "One or more requested market/date combinations failed or were skipped."
+            exit 1
+          fi
+
+          echo "All requested market/date combinations completed successfully."

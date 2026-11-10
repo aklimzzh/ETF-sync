@@ -2,9 +2,10 @@ name: Daily ETF Import
 
 on:
   schedule:
-    - cron: '16 21 * * 1-5'
+    - cron: '16 16 * * 1-5'
     - cron: '35 22 * * 1-5'
     - cron: '7 23 * * 1-5'
+  workflow_dispatch:
     
 permissions:
   contents: write

@@ -87,8 +87,8 @@ jobs:
           payload = {
               "prefixes": [
                   f"etf-api.{domain}/api/v1/dashboard/",
-         f"etf-api.{domain}/api/v1/rankings",
-         f"etf-api.{domain}/api/v1/etf/",
+                  f"etf-api.{domain}/api/v1/rankings",
+                  f"etf-api.{domain}/api/v1/etf/",
               ]
           }
           req = urllib.request.Request(

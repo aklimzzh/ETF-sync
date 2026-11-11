@@ -1,0 +1,89 @@
+name: Daily Index Import
+
+on:
+  schedule:
+    # UTC 10:20 = Shanghai 18:20
+    - cron: "20 10 * * 1-5"
+
+    # UTC 12:20 = Shanghai 20:20
+    - cron: "20 12 * * 1-5"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: index-data-writer
+  cancel-in-progress: false
+
+jobs:
+  import-index:
+    name: Import Market Index Data
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      ETF_API_URL: ${{ secrets.ETF_API_URL }}
+      ETF_API_TOKEN: ${{ secrets.ETF_API_TOKEN }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Show trigger information
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Schedule: ${{ github.event.schedule }}"
+          echo "UTC time:"
+          date -u
+          echo "Shanghai time:"
+          TZ=Asia/Shanghai date
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Show dependency versions
+        run: |
+          python --version
+          python -c "import akshare; print('AKShare:', akshare.__version__)"
+          python -c "import pandas; print('pandas:', pandas.__version__)"
+          python -c "import requests; print('requests:', requests.__version__)"
+
+      - name: Check required environment variables
+        run: |
+          python - <<'PY'
+          import os
+
+          required = (
+              "ETF_API_URL",
+              "ETF_API_TOKEN",
+          )
+
+          missing = [
+              name
+              for name in required
+              if not os.environ.get(name, "").strip()
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "Missing required environment variables: "
+                  + ", ".join(missing)
+              )
+
+          print("Required environment variables are configured.")
+          PY
+
+      - name: Fetch and import index data
+        run: |
+          python -m src.sync_index_daily

@@ -1,4 +1,12 @@
-"""Daily market-index synchronization through AKShare and Serv00 API."""
+"""Daily multi-source index synchronization.
+
+Source priority:
+1. Tencent via AKShare stock_zh_index_daily_tx
+2. Sina via AKShare stock_zh_index_daily
+3. Eastmoney via AKShare index_zh_a_hist
+
+The script normalizes all sources to the existing Serv00 index import API.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +17,7 @@ import random
 import sys
 import time
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import akshare as ak
@@ -18,803 +26,426 @@ import requests
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+LOOKBACK_DAYS = int(os.getenv("INDEX_LOOKBACK_DAYS", "10"))
+STARTUP_JITTER_MAX = int(os.getenv("INDEX_STARTUP_JITTER_MAX", "240"))
+BETWEEN_INDEX_MIN = float(os.getenv("INDEX_BETWEEN_INDEX_MIN", "3"))
+BETWEEN_INDEX_MAX = float(os.getenv("INDEX_BETWEEN_INDEX_MAX", "8"))
+SOURCE_WAIT_SECONDS = float(os.getenv("INDEX_SOURCE_WAIT_SECONDS", "5"))
+HTTP_TIMEOUT = (20, 120)
 
 INDEX_CONFIG = {
     "SSE": {
-        "symbol": "000001",
         "name": "上证指数",
+        "symbol_tx": "sh000001",
+        "symbol_sina": "sh000001",
+        "symbol_em": "000001",
     },
     "SZSE": {
-        "symbol": "399001",
         "name": "深证成指",
+        "symbol_tx": "sz399001",
+        "symbol_sina": "sz399001",
+        "symbol_em": "399001",
     },
     "STAR50": {
-        "symbol": "000688",
         "name": "科创50",
+        "symbol_tx": "sh000688",
+        "symbol_sina": "sh000688",
+        "symbol_em": "000688",
     },
     "CHINEXT": {
-        "symbol": "399006",
         "name": "创业板指",
+        "symbol_tx": "sz399006",
+        "symbol_sina": "sz399006",
+        "symbol_em": "399006",
     },
 }
 
-INDEX_ORDER = (
-    "SSE",
-    "SZSE",
-    "STAR50",
-    "CHINEXT",
-)
+INDEX_ORDER = ("SSE", "SZSE", "STAR50", "CHINEXT")
+SOURCE_ORDER = ("tencent", "sina", "eastmoney")
 
-COLUMN_MAP = {
-    "日期": "trade_date",
-    "开盘": "open_price",
-    "收盘": "close_price",
-    "最高": "high_price",
-    "最低": "low_price",
-    "成交量": "volume",
-    "成交额": "amount",
-    "振幅": "amplitude_pct",
-    "涨跌幅": "change_pct",
-    "涨跌额": "change_amount",
-    "换手率": "turnover_pct",
-}
-
-REQUIRED_COLUMNS = {
+CANONICAL_COLUMNS = (
     "trade_date",
     "open_price",
-    "close_price",
     "high_price",
     "low_price",
-    "volume",
-    "amount",
-    "amplitude_pct",
-    "change_pct",
-    "change_amount",
-    "turnover_pct",
-}
-
-NUMERIC_COLUMNS = (
-    "open_price",
     "close_price",
-    "high_price",
-    "low_price",
     "volume",
     "amount",
-    "amplitude_pct",
-    "change_pct",
     "change_amount",
+    "change_pct",
+    "amplitude_pct",
     "turnover_pct",
 )
 
-FETCH_RETRY_DELAYS = (5, 15, 30)
-UPLOAD_RETRY_DELAYS = (5, 15, 30)
-
-TRANSIENT_HTTP_STATUS = {
-    408,
-    425,
-    429,
-    500,
-    502,
-    503,
-    504,
+COLUMN_ALIASES = {
+    "date": "trade_date",
+    "日期": "trade_date",
+    "open": "open_price",
+    "开盘": "open_price",
+    "high": "high_price",
+    "最高": "high_price",
+    "low": "low_price",
+    "最低": "low_price",
+    "close": "close_price",
+    "收盘": "close_price",
+    "volume": "volume",
+    "成交量": "volume",
+    "vol": "volume",
+    "amount": "amount",
+    "成交额": "amount",
+    "turnover": "turnover_pct",
+    "turnover_rate": "turnover_pct",
+    "换手率": "turnover_pct",
+    "change_amount": "change_amount",
+    "涨跌额": "change_amount",
+    "change_pct": "change_pct",
+    "change_rate": "change_pct",
+    "涨跌幅": "change_pct",
+    "amplitude": "amplitude_pct",
+    "amplitude_pct": "amplitude_pct",
+    "振幅": "amplitude_pct",
 }
 
 
-def _required_environment() -> tuple[str, str]:
-    api_url = os.environ.get(
-        "ETF_API_URL",
-        "",
-    ).strip().rstrip("/")
+class SourceError(RuntimeError):
+    pass
 
-    api_token = os.environ.get(
-        "ETF_API_TOKEN",
-        "",
-    ).strip()
 
+def required_environment() -> tuple[str, str]:
+    api_url = os.environ.get("ETF_API_URL", "").strip().rstrip("/")
+    api_token = os.environ.get("ETF_API_TOKEN", "").strip()
     if not api_url:
-        raise RuntimeError(
-            "ETF_API_URL environment variable is required"
-        )
-
+        raise RuntimeError("ETF_API_URL environment variable is required")
     if not api_token:
-        raise RuntimeError(
-            "ETF_API_TOKEN environment variable is required"
-        )
-
+        raise RuntimeError("ETF_API_TOKEN environment variable is required")
     return api_url, api_token
 
 
-def _shanghai_today() -> date:
+def shanghai_today() -> date:
     return datetime.now(SHANGHAI_TZ).date()
 
 
-def _date_range() -> tuple[str, str]:
-    """Return the latest seven natural days in AKShare format."""
-
-    today = _shanghai_today()
-
-    start_date = (
-        today - timedelta(days=7)
-    ).strftime("%Y%m%d")
-
-    end_date = today.strftime("%Y%m%d")
-
-    return start_date, end_date
+def request_range() -> tuple[str, str, date, date]:
+    end = shanghai_today()
+    start = end - timedelta(days=LOOKBACK_DAYS)
+    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), start, end
 
 
-def _json_response(
-    response: requests.Response,
-    operation: str,
-) -> dict[str, Any]:
-    try:
-        result = response.json()
-    except ValueError as exc:
-        preview = response.text[:1000]
-
-        raise RuntimeError(
-            f"{operation} returned invalid JSON: {preview}"
-        ) from exc
-
-    if not isinstance(result, dict):
-        raise RuntimeError(
-            f"{operation} returned unexpected JSON type: "
-            f"{type(result).__name__}"
-        )
-
-    return result
-
-
-def _fetch_index(
-    index_code: str,
-    start_date: str,
-    end_date: str,
-) -> pd.DataFrame:
-    config = INDEX_CONFIG[index_code]
-
-    attempts = len(FETCH_RETRY_DELAYS) + 1
-
-    for attempt in range(1, attempts + 1):
-        try:
-            print(
-                f"{index_code}: fetching "
-                f"{config['name']} ({config['symbol']}), "
-                f"{start_date} to {end_date}, "
-                f"attempt {attempt}/{attempts}"
-            )
-
-            frame = ak.index_zh_a_hist(
-                symbol=config["symbol"],
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-            )
-
-            if not isinstance(frame, pd.DataFrame):
-                raise RuntimeError(
-                    "AKShare did not return a DataFrame"
-                )
-
-            print(
-                f"{index_code}: AKShare returned "
-                f"{len(frame)} row(s)"
-            )
-
-            return frame
-
-        except Exception as exc:
-            print(
-                f"{index_code}: fetch attempt "
-                f"{attempt}/{attempts} failed: {exc}",
-                file=sys.stderr,
-            )
-
-            if attempt < attempts:
-                base_delay = FETCH_RETRY_DELAYS[
-                    attempt - 1
-                ]
-
-                delay = base_delay + random.uniform(
-                    0,
-                    2,
-                )
-
-                print(
-                    f"{index_code}: retrying fetch "
-                    f"in {delay:.1f}s..."
-                )
-
-                time.sleep(delay)
-
-    raise RuntimeError(
-        f"{index_code}: AKShare fetch failed "
-        f"after {attempts} attempts"
-    )
-
-
-def _safe_value(value: Any) -> Any:
-    if value is None:
+def safe_json(value: Any) -> Any:
+    if value is None or pd.isna(value):
         return None
-
-    if pd.isna(value):
-        return None
-
-    if isinstance(
-        value,
-        (pd.Timestamp, datetime, date),
-    ):
+    if isinstance(value, (pd.Timestamp, datetime, date)):
         return value.strftime("%Y-%m-%d")
-
     if hasattr(value, "item"):
         value = value.item()
-
     if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return None
-
-        return float(value)
-
+        return None if math.isnan(value) or math.isinf(value) else float(value)
     if isinstance(value, int):
         return int(value)
-
     return value
 
 
-def _prepare_records(
-    frame: pd.DataFrame,
-    index_code: str,
-) -> list[dict[str, Any]]:
-    if frame.empty:
-        return []
+def standardize_source_frame(
+    raw: pd.DataFrame,
+    *,
+    source: str,
+    start_day: date,
+    end_day: date,
+) -> pd.DataFrame:
+    if not isinstance(raw, pd.DataFrame) or raw.empty:
+        raise SourceError(f"{source}: empty DataFrame")
 
-    config = INDEX_CONFIG[index_code]
+    frame = raw.copy()
+    frame.columns = [str(c).strip() for c in frame.columns]
+    frame = frame.rename(columns={c: COLUMN_ALIASES.get(c, c) for c in frame.columns})
 
-    normalized = frame.rename(
-        columns=COLUMN_MAP
-    ).copy()
+    required = {"trade_date", "open_price", "high_price", "low_price", "close_price"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise SourceError(f"{source}: missing columns {missing}; actual={list(frame.columns)}")
 
-    missing_columns = sorted(
-        REQUIRED_COLUMNS - set(normalized.columns)
+    for column in CANONICAL_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    for column in CANONICAL_COLUMNS:
+        if column != "trade_date":
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    frame = frame.dropna(subset=["trade_date", "close_price"])
+    frame = frame.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+
+    # Calculate derived values before filtering, so the first requested day can use
+    # the previous trading day's close when the source returned longer history.
+    previous_close = frame["close_price"].shift(1)
+    calculated_change_amount = frame["close_price"] - previous_close
+    calculated_change_pct = calculated_change_amount / previous_close * 100
+    calculated_amplitude_pct = (
+        (frame["high_price"] - frame["low_price"]) / previous_close * 100
     )
 
-    if missing_columns:
-        raise RuntimeError(
-            f"{index_code}: missing AKShare columns: "
-            f"{missing_columns}"
-        )
+    frame["change_amount"] = frame["change_amount"].fillna(calculated_change_amount)
+    frame["change_pct"] = frame["change_pct"].fillna(calculated_change_pct)
+    frame["amplitude_pct"] = frame["amplitude_pct"].fillna(calculated_amplitude_pct)
 
-    normalized = normalized[
-        [
-            "trade_date",
-            "open_price",
-            "close_price",
-            "high_price",
-            "low_price",
-            "volume",
-            "amount",
-            "amplitude_pct",
-            "change_pct",
-            "change_amount",
-            "turnover_pct",
-        ]
+    frame = frame[
+        (frame["trade_date"].dt.date >= start_day)
+        & (frame["trade_date"].dt.date <= end_day)
     ].copy()
 
-    normalized["trade_date"] = pd.to_datetime(
-        normalized["trade_date"],
-        errors="coerce",
+    if frame.empty:
+        raise SourceError(f"{source}: no rows in requested date range")
+
+    invalid = (
+        (frame["close_price"] < 0)
+        | (frame["high_price"] < frame["low_price"])
+        | (frame["volume"].notna() & (frame["volume"] < 0))
+        | (frame["amount"].notna() & (frame["amount"] < 0))
     )
+    if invalid.any():
+        raise SourceError(f"{source}: {int(invalid.sum())} invalid market-data row(s)")
 
-    for column in NUMERIC_COLUMNS:
-        normalized[column] = pd.to_numeric(
-            normalized[column],
-            errors="coerce",
-        )
+    return frame[list(CANONICAL_COLUMNS)].copy()
 
-    invalid_date_count = int(
-        normalized["trade_date"].isna().sum()
+
+def fetch_tencent(index_code: str, start_day: date, end_day: date) -> pd.DataFrame:
+    symbol = INDEX_CONFIG[index_code]["symbol_tx"]
+    raw = ak.stock_zh_index_daily_tx(symbol=symbol)
+    return standardize_source_frame(raw, source="tencent", start_day=start_day, end_day=end_day)
+
+
+def fetch_sina(index_code: str, start_day: date, end_day: date) -> pd.DataFrame:
+    symbol = INDEX_CONFIG[index_code]["symbol_sina"]
+    raw = ak.stock_zh_index_daily(symbol=symbol)
+    return standardize_source_frame(raw, source="sina", start_day=start_day, end_day=end_day)
+
+
+def fetch_eastmoney(
+    index_code: str,
+    start_text: str,
+    end_text: str,
+    start_day: date,
+    end_day: date,
+) -> pd.DataFrame:
+    symbol = INDEX_CONFIG[index_code]["symbol_em"]
+    raw = ak.index_zh_a_hist(
+        symbol=symbol,
+        period="daily",
+        start_date=start_text,
+        end_date=end_text,
     )
+    return standardize_source_frame(raw, source="eastmoney", start_day=start_day, end_day=end_day)
 
-    invalid_close_count = int(
-        normalized["close_price"].isna().sum()
-    )
 
-    if invalid_date_count:
-        print(
-            f"{index_code}: dropping "
-            f"{invalid_date_count} invalid date row(s)",
-            file=sys.stderr,
-        )
+def fetch_with_fallback(
+    index_code: str,
+    start_text: str,
+    end_text: str,
+    start_day: date,
+    end_day: date,
+) -> tuple[pd.DataFrame, str]:
+    errors: list[str] = []
 
-    if invalid_close_count:
-        print(
-            f"{index_code}: dropping "
-            f"{invalid_close_count} row(s) "
-            "without close price",
-            file=sys.stderr,
-        )
-
-    normalized = normalized.dropna(
-        subset=[
-            "trade_date",
-            "close_price",
-        ]
-    )
-
-    normalized = normalized[
-        normalized["close_price"] >= 0
+    fetchers: list[tuple[str, Callable[[], pd.DataFrame]]] = [
+        ("tencent", lambda: fetch_tencent(index_code, start_day, end_day)),
+        ("sina", lambda: fetch_sina(index_code, start_day, end_day)),
+        (
+            "eastmoney",
+            lambda: fetch_eastmoney(
+                index_code, start_text, end_text, start_day, end_day
+            ),
+        ),
     ]
 
-    normalized = normalized[
-        normalized["volume"].isna()
-        | (normalized["volume"] >= 0)
-    ]
+    for source, fetcher in fetchers:
+        try:
+            print(f"{index_code}: source={source}, fetching...")
+            frame = fetcher()
+            print(
+                f"{index_code}: source={source}, PASS, rows={len(frame)}, "
+                f"{frame.iloc[0]['trade_date'].date()} -> {frame.iloc[-1]['trade_date'].date()}"
+            )
+            return frame, source
+        except Exception as exc:
+            message = f"{source}: {type(exc).__name__}: {exc}"
+            errors.append(message)
+            print(f"{index_code}: source={source}, FAILED: {exc}", file=sys.stderr)
+            if source != SOURCE_ORDER[-1]:
+                time.sleep(SOURCE_WAIT_SECONDS)
 
-    normalized = normalized[
-        normalized["amount"].isna()
-        | (normalized["amount"] >= 0)
-    ]
+    raise RuntimeError(f"{index_code}: all sources failed | " + " | ".join(errors))
 
-    invalid_high_low = (
-        normalized["high_price"].notna()
-        & normalized["low_price"].notna()
-        & (
-            normalized["high_price"]
-            < normalized["low_price"]
-        )
-    )
 
-    if invalid_high_low.any():
-        count = int(invalid_high_low.sum())
-
-        print(
-            f"{index_code}: dropping {count} row(s) "
-            "where high_price < low_price",
-            file=sys.stderr,
-        )
-
-        normalized = normalized[
-            ~invalid_high_low
-        ]
-
-    normalized = normalized.sort_values(
-        "trade_date"
-    )
-
-    duplicate_count = int(
-        normalized.duplicated(
-            subset=["trade_date"],
-            keep="last",
-        ).sum()
-    )
-
-    if duplicate_count:
-        print(
-            f"{index_code}: removing "
-            f"{duplicate_count} duplicate date row(s)"
-        )
-
-    normalized = normalized.drop_duplicates(
-        subset=["trade_date"],
-        keep="last",
-    )
-
+def records_from_frame(
+    frame: pd.DataFrame,
+    index_code: str,
+    source: str,
+) -> list[dict[str, Any]]:
+    config = INDEX_CONFIG[index_code]
     records: list[dict[str, Any]] = []
 
-    for _, row in normalized.iterrows():
-        volume_value = row.get("volume")
-
-        record = {
-            "index_code": index_code,
-            "index_symbol": config["symbol"],
-            "index_name": config["name"],
-            "trade_date": (
-                row["trade_date"].strftime("%Y-%m-%d")
-            ),
-            "open_price": _safe_value(
-                row.get("open_price")
-            ),
-            "high_price": _safe_value(
-                row.get("high_price")
-            ),
-            "low_price": _safe_value(
-                row.get("low_price")
-            ),
-            "close_price": _safe_value(
-                row.get("close_price")
-            ),
-            "volume": (
-                None
-                if pd.isna(volume_value)
-                else int(volume_value)
-            ),
-            "amount": _safe_value(
-                row.get("amount")
-            ),
-            "change_amount": _safe_value(
-                row.get("change_amount")
-            ),
-            "change_pct": _safe_value(
-                row.get("change_pct")
-            ),
-            "amplitude_pct": _safe_value(
-                row.get("amplitude_pct")
-            ),
-            "turnover_pct": _safe_value(
-                row.get("turnover_pct")
-            ),
-            "source": "akshare",
-        }
-
-        records.append(record)
-
-    json.dumps(
-        records,
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-
-    if records:
-        print(
-            f"{index_code}: prepared "
-            f"{len(records)} valid row(s), "
-            f"{records[0]['trade_date']} to "
-            f"{records[-1]['trade_date']}"
+    for _, row in frame.iterrows():
+        volume = row.get("volume")
+        records.append(
+            {
+                "index_code": index_code,
+                "index_symbol": config["symbol_em"],
+                "index_name": config["name"],
+                "trade_date": row["trade_date"].strftime("%Y-%m-%d"),
+                "open_price": safe_json(row.get("open_price")),
+                "high_price": safe_json(row.get("high_price")),
+                "low_price": safe_json(row.get("low_price")),
+                "close_price": safe_json(row.get("close_price")),
+                "volume": None if pd.isna(volume) else int(volume),
+                "amount": safe_json(row.get("amount")),
+                "change_amount": safe_json(row.get("change_amount")),
+                "change_pct": safe_json(row.get("change_pct")),
+                "amplitude_pct": safe_json(row.get("amplitude_pct")),
+                "turnover_pct": safe_json(row.get("turnover_pct")),
+                "source": source,
+            }
         )
 
+    json.dumps(records, ensure_ascii=False, allow_nan=False)
     return records
 
 
-def _upload_records(
-    *,
+def upload_records(
     api_url: str,
     token: str,
     index_code: str,
     records: list[dict[str, Any]],
-) -> dict[str, Any] | None:
+) -> None:
     if not records:
-        print(
-            f"{index_code}: no records to upload"
-        )
+        raise RuntimeError(f"{index_code}: no records prepared")
 
-        return None
-
-    if len(records) > 500:
-        raise RuntimeError(
-            f"{index_code}: received {len(records)} rows; "
-            "the index import API allows at most 500"
-        )
-
-    url = (
-        f"{api_url}"
-        "/api/v1/index/import"
-    )
-
-    payload = {
-        "source": "akshare",
-        "records": records,
-    }
-
-    attempts = len(UPLOAD_RETRY_DELAYS) + 1
-
-    for attempt in range(1, attempts + 1):
-        try:
-            print(
-                f"{index_code}: uploading "
-                f"{len(records)} row(s), "
-                f"attempt {attempt}/{attempts}"
-            )
-
-            response = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/json",
-                },
-                json=payload,
-                timeout=(20, 120),
-            )
-
-            if response.status_code in (
-                TRANSIENT_HTTP_STATUS
-            ):
-                raise requests.HTTPError(
-                    "transient HTTP "
-                    f"{response.status_code}",
-                    response=response,
-                )
-
-            try:
-                response.raise_for_status()
-            except requests.HTTPError as exc:
-                raise RuntimeError(
-                    f"{index_code}: import HTTP "
-                    f"{response.status_code}: "
-                    f"{response.text[:1000]}"
-                ) from exc
-
-            result = _json_response(
-                response,
-                f"{index_code} index import",
-            )
-
-            if result.get("success") is not True:
-                raise RuntimeError(
-                    f"{index_code}: API returned "
-                    f"success != true: {result}"
-                )
-
-            if result.get("committed") is not True:
-                raise RuntimeError(
-                    f"{index_code}: API did not confirm "
-                    f"database commit: {result}"
-                )
-
-            received = result.get("received")
-            upserted = result.get("upserted")
-
-            if received != len(records):
-                raise RuntimeError(
-                    f"{index_code}: API received count "
-                    f"mismatch, sent {len(records)}, "
-                    f"received {received}"
-                )
-
-            if upserted != len(records):
-                raise RuntimeError(
-                    f"{index_code}: API upsert count "
-                    f"mismatch, sent {len(records)}, "
-                    f"upserted {upserted}"
-                )
-
-            print(
-                f"{index_code}: upload PASS, "
-                f"{upserted} row(s) upserted"
-            )
-
-            return result
-
-        except RuntimeError:
-            # Validation or application errors are deterministic.
-            # Do not retry them blindly.
-            raise
-
-        except requests.RequestException as exc:
-            print(
-                f"{index_code}: upload attempt "
-                f"{attempt}/{attempts} failed: {exc}",
-                file=sys.stderr,
-            )
-
-            if attempt < attempts:
-                base_delay = UPLOAD_RETRY_DELAYS[
-                    attempt - 1
-                ]
-
-                delay = base_delay + random.uniform(
-                    0,
-                    2,
-                )
-
-                print(
-                    f"{index_code}: retrying upload "
-                    f"in {delay:.1f}s..."
-                )
-
-                time.sleep(delay)
-
-    raise RuntimeError(
-        f"{index_code}: upload failed after "
-        f"{attempts} attempts"
-    )
-
-
-def _get_status(
-    api_url: str,
-) -> dict[str, Any]:
-    url = (
-        f"{api_url}"
-        "/api/v1/index/status"
-    )
-
-    response = requests.get(
-        url,
+    response = requests.post(
+        f"{api_url}/api/v1/index/import",
         headers={
+            "Authorization": f"Bearer {token}",
             "Accept": "application/json",
+            "User-Agent": "ETF-Monitor-Multi-Source-Index/2.0",
         },
+        json={"source": records[0]["source"], "records": records},
+        timeout=HTTP_TIMEOUT,
+    )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{index_code}: import returned invalid JSON, HTTP {response.status_code}: "
+            f"{response.text[:800]}"
+        ) from exc
+
+    if response.status_code not in {200, 201} or payload.get("success") is not True:
+        raise RuntimeError(
+            f"{index_code}: import failed, HTTP {response.status_code}: {payload}"
+        )
+
+    if payload.get("upserted") != len(records):
+        raise RuntimeError(
+            f"{index_code}: upsert count mismatch; sent={len(records)}, "
+            f"upserted={payload.get('upserted')}"
+        )
+
+    print(
+        f"{index_code}: uploaded={len(records)}, source={records[0]['source']}, PASS"
+    )
+
+
+def verify_status(api_url: str, expected_dates: dict[str, str]) -> None:
+    response = requests.get(
+        f"{api_url}/api/v1/index/status",
+        headers={"Accept": "application/json"},
         timeout=(15, 45),
     )
-
     response.raise_for_status()
+    payload = response.json()
+    if payload.get("success") is not True:
+        raise RuntimeError(f"status API failed: {payload}")
 
-    result = _json_response(
-        response,
-        "Index status",
-    )
-
-    if result.get("success") is not True:
-        raise RuntimeError(
-            f"Index status returned "
-            f"success != true: {result}"
-        )
-
-    return result
-
-
-def _verify_status(
-    api_url: str,
-    uploaded_latest_dates: dict[str, str],
-) -> None:
-    result = _get_status(api_url)
-
-    rows = result.get("data")
-
-    if not isinstance(rows, list):
-        raise RuntimeError(
-            "Index status response has no data list"
-        )
-
-    status_by_code = {
-        row.get("index_code"): row
-        for row in rows
-        if isinstance(row, dict)
-    }
-
-    print()
-    print("Database index status:")
-
-    for index_code in INDEX_ORDER:
-        status = status_by_code.get(index_code)
-
-        if status is None:
-            raise RuntimeError(
-                f"{index_code}: missing from "
-                "index status response"
-            )
-
-        row_count = status.get("row_count")
-        first_date = status.get("first_date")
-        latest_date = status.get("latest_date")
-
+    rows = {item["index_code"]: item for item in payload.get("data", [])}
+    print("\nDatabase status:")
+    for code in INDEX_ORDER:
+        item = rows.get(code)
+        if not item:
+            raise RuntimeError(f"{code}: missing from status API")
+        latest = item.get("latest_date")
+        expected = expected_dates.get(code)
         print(
-            f"  {index_code:8} "
-            f"rows={str(row_count):>6} "
-            f"first={first_date} "
-            f"latest={latest_date}"
+            f"  {code:8} rows={item.get('row_count'):>6} "
+            f"latest={latest} expected>={expected}"
         )
-
-        expected_latest = uploaded_latest_dates.get(
-            index_code
-        )
-
-        if (
-            expected_latest
-            and latest_date
-            and latest_date < expected_latest
-        ):
+        if expected and (not latest or latest < expected):
             raise RuntimeError(
-                f"{index_code}: database latest date "
-                f"{latest_date} is earlier than uploaded "
-                f"date {expected_latest}"
+                f"{code}: database latest date {latest} is earlier than {expected}"
             )
 
 
 def main() -> int:
     try:
-        api_url, api_token = (
-            _required_environment()
-        )
+        api_url, api_token = required_environment()
+        start_text, end_text, start_day, end_day = request_range()
 
-        start_date, end_date = _date_range()
+        print("ETF Monitor - Multi-source Daily Index Sync")
+        print(f"Shanghai time: {datetime.now(SHANGHAI_TZ).isoformat()}")
+        print(f"Requested range: {start_text} -> {end_text}")
+        print("Source priority: tencent -> sina -> eastmoney")
 
-        print(
-            "ETF Monitor - Daily Index Sync"
-        )
+        if STARTUP_JITTER_MAX > 0:
+            delay = random.randint(0, STARTUP_JITTER_MAX)
+            print(f"Startup jitter: {delay}s")
+            time.sleep(delay)
 
-        print(
-            "Shanghai time: "
-            f"{datetime.now(SHANGHAI_TZ).isoformat()}"
-        )
+        failures: dict[str, str] = {}
+        expected_dates: dict[str, str] = {}
+        used_sources: dict[str, str] = {}
 
-        print(
-            f"AKShare range: "
-            f"{start_date} to {end_date}"
-        )
-
-        failed_indexes: dict[str, str] = {}
-        uploaded_latest_dates: dict[str, str] = {}
-
-        for index_code in INDEX_ORDER:
-            print()
-            print("=" * 64)
-
+        for position, index_code in enumerate(INDEX_ORDER):
+            print("\n" + "=" * 64)
             try:
-                frame = _fetch_index(
-                    index_code=index_code,
-                    start_date=start_date,
-                    end_date=end_date,
+                frame, source = fetch_with_fallback(
+                    index_code,
+                    start_text,
+                    end_text,
+                    start_day,
+                    end_day,
                 )
-
-                records = _prepare_records(
-                    frame=frame,
-                    index_code=index_code,
-                )
-
-                if not records:
-                    print(
-                        f"{index_code}: no market data "
-                        "returned for the selected period"
-                    )
-
-                    continue
-
-                _upload_records(
-                    api_url=api_url,
-                    token=api_token,
-                    index_code=index_code,
-                    records=records,
-                )
-
-                uploaded_latest_dates[index_code] = (
-                    records[-1]["trade_date"]
-                )
-
+                records = records_from_frame(frame, index_code, source)
+                upload_records(api_url, api_token, index_code, records)
+                expected_dates[index_code] = records[-1]["trade_date"]
+                used_sources[index_code] = source
             except Exception as exc:
-                failed_indexes[index_code] = str(exc)
+                failures[index_code] = str(exc)
+                print(f"{index_code}: FAILED: {exc}", file=sys.stderr)
 
-                print(
-                    f"{index_code}: FAILED - {exc}",
-                    file=sys.stderr,
-                )
-
-        print()
-        print("=" * 64)
+            if position < len(INDEX_ORDER) - 1:
+                delay = random.uniform(BETWEEN_INDEX_MIN, BETWEEN_INDEX_MAX)
+                print(f"Waiting {delay:.1f}s before next index...")
+                time.sleep(delay)
 
         try:
-            _verify_status(
-                api_url=api_url,
-                uploaded_latest_dates=(
-                    uploaded_latest_dates
-                ),
-            )
-
+            verify_status(api_url, expected_dates)
         except Exception as exc:
-            failed_indexes["STATUS"] = str(exc)
+            failures["STATUS"] = str(exc)
 
-            print(
-                f"STATUS: FAILED - {exc}",
-                file=sys.stderr,
-            )
+        print("\nSource summary:")
+        for code in INDEX_ORDER:
+            print(f"  {code:8} {used_sources.get(code, 'FAILED')}")
 
-        if failed_indexes:
-            print()
-            print(
-                "Index synchronization completed "
-                "with failures:",
-                file=sys.stderr,
-            )
-
-            for item, message in (
-                failed_indexes.items()
-            ):
-                print(
-                    f"  {item}: {message}",
-                    file=sys.stderr,
-                )
-
+        if failures:
+            print("\nFailures:", file=sys.stderr)
+            for key, value in failures.items():
+                print(f"  {key}: {value}", file=sys.stderr)
             return 1
 
-        print()
-        print(
-            "All indexes synchronized successfully."
-        )
-
+        print("\nAll indexes synchronized successfully.")
         return 0
 
     except Exception as exc:
-        print(
-            f"Index synchronization failed: {exc}",
-            file=sys.stderr,
-        )
-
+        print(f"Index synchronization failed: {exc}", file=sys.stderr)
         return 1
 
 

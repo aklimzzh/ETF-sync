@@ -2,8 +2,10 @@ name: Daily Market Import
 
 on:
   schedule:
-    - cron: "43 22 * * 1-5"   # 北京时间周二~周六 06:43
-    - cron: "22 23 * * 1-5"   # 北京时间周二~周六 07:22
+    - cron: "43 6 * * 1-6"   # 北京时间周二~周六 06:43
+      timezone: "Asia/Shanghai"
+    - cron: "22 7 * * 1-5"   # 北京时间周二~周六 07:22
+      timezone: "Asia/Shanghai"
 
   workflow_dispatch:
 

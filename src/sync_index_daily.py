@@ -211,13 +211,13 @@ def standardize_source_frame(
 
 def fetch_tencent(index_code: str, start_day: date, end_day: date) -> pd.DataFrame:
     symbol = INDEX_CONFIG[index_code]["symbol_tx"]
-    raw = ak.stock_zh_index_daily_tx(symbol=symbol)
+    raw = ak.index_zh_daily_tx(symbol=symbol)
     return standardize_source_frame(raw, source="tencent", start_day=start_day, end_day=end_day)
 
 
 def fetch_sina(index_code: str, start_day: date, end_day: date) -> pd.DataFrame:
     symbol = INDEX_CONFIG[index_code]["symbol_sina"]
-    raw = ak.stock_zh_index_daily(symbol=symbol)
+    raw = ak.index_zh_daily_sina(symbol=symbol)
     return standardize_source_frame(raw, source="sina", start_day=start_day, end_day=end_day)
 
 
@@ -229,7 +229,7 @@ def fetch_eastmoney(
     end_day: date,
 ) -> pd.DataFrame:
     symbol = INDEX_CONFIG[index_code]["symbol_em"]
-    raw = ak.index_zh_a_hist(
+    raw = ak.index_zh_hist_em(
         symbol=symbol,
         period="daily",
         start_date=start_text,

@@ -26,8 +26,8 @@ import requests
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-LOOKBACK_DAYS = int(os.getenv("INDEX_LOOKBACK_DAYS", "10"))
-STARTUP_JITTER_MAX = int(os.getenv("INDEX_STARTUP_JITTER_MAX", "240"))
+LOOKBACK_DAYS = int(os.getenv("INDEX_LOOKBACK_DAYS", "3"))
+STARTUP_JITTER_MAX = int(os.getenv("INDEX_STARTUP_JITTER_MAX", "40"))
 BETWEEN_INDEX_MIN = float(os.getenv("INDEX_BETWEEN_INDEX_MIN", "3"))
 BETWEEN_INDEX_MAX = float(os.getenv("INDEX_BETWEEN_INDEX_MAX", "8"))
 SOURCE_WAIT_SECONDS = float(os.getenv("INDEX_SOURCE_WAIT_SECONDS", "5"))
